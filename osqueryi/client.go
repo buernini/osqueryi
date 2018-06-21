@@ -2,7 +2,6 @@ package osqueryi
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -11,16 +10,16 @@ import (
 
 // ++++++ Osquery client struct
 type OsqClient struct {
-	conn     net.Conn
-	Host     string
-	Port     int
-	Formater FormaterInterface
-	History  CmdHistoryInterface
+	conn           net.Conn
+	Host           string
+	Port           int
+	User, Password string
+	Formater       FormaterInterface
 }
 
 // ++++++ Build connect
-func (t *OsqClient) connect() (err error) {
-	var addr string = fmt.Sprintf("%s:%d", t.Host, t.Port)
+func (self *OsqClient) connect() (err error) {
+	var addr string = fmt.Sprintf("%s:%d", self.Host, self.Port)
 	var network string = `tcp`
 	var dialer *net.Dialer
 
@@ -29,83 +28,124 @@ func (t *OsqClient) connect() (err error) {
 		KeepAlive: 3 * time.Second,
 	}
 
-	if t.conn, err = dialer.Dial(network, addr); err != nil {
+	if self.conn, err = dialer.Dial(network, addr); err != nil {
 		return err
 	}
 	return nil
 }
 
 // ++++++ Client run
-func (t *OsqClient) run() (err error) {
+func (self *OsqClient) run() (err error) {
 	var c byte
-	var buf *bytes.Buffer
 	var response []byte
+	var resType uint16
 
-	buf = bytes.NewBuffer([]byte{})
-	if err = t.connect(); err != nil {
+	if err = self.connect(); err != nil {
 		return err
 	}
-	t.guide()
-	if t.Formater == nil {
-		t.Formater = DefaultFormater{}
+	defer self.conn.Close()
+
+	cmder := new(OsqCommand)
+	cmder.init()
+
+	// send auth data
+	authData := []byte(fmt.Sprintf("%s %s", self.User, self.Password))
+	if err = self.execCmd(typeReqAuth, authData); err != nil {
+		return err
 	}
+	self.toStdout([]byte{})
+
+	if self.Formater == nil {
+		self.Formater = DefaultFormater{}
+	}
+
 	for {
 		fmt.Scanf("%c", &c)
-		if c == 10 {
+		if done, _ := self.cmdAnalyze(cmder, c); !done {
 			continue
 		}
-		buf.WriteByte(c)
-		if c == 59 {
-			if quit := t.isQuit(buf.Bytes()); quit {
-				buf.Reset()
-				t.conn.Close()
+
+		/*
+			if quit := self.isQuit(); quit {
 				break
 			}
-			if response, err = t.exec(buf.Bytes()); err != nil {
-				buf.Reset()
-				break
-			}
-			buf.Reset()
-			fmt.Fprintf(os.Stdout, "%s", t.Formater.draw(response))
-			t.guide()
+		*/
+		if err = self.execCmd(cmder.Type, cmder.cmd.Bytes()); err != nil {
+			self.toStdout([]byte(fmt.Sprintf("%s", err)))
+			continue
+		}
+		cmder.reset()
+
+		if resType, response, err = self.result(); err != nil {
+			self.toStdout([]byte(fmt.Sprintf("%s", err)))
+			continue
+		}
+
+		if resType == typeError {
+			self.toStdout(response)
+			continue
+		}
+		if resType != typeResNormal {
+			self.toStdout([]byte(`unknow resType`))
+			continue
+		}
+
+		switch cmder.Type {
+		case typeReqHelpCmd:
+			self.toStdout(response)
+		default:
+			self.toStdout(self.Formater.draw(response))
 		}
 	}
 	return err
 }
 
-// ++++++ Check client quit command
-func (t *OsqClient) isQuit(cmd []byte) bool {
-	return bytes.Compare(cmd[0:5], []byte(`quit;`)) == 0
-}
-
-// ++++++ Write client command to server
-func (t *OsqClient) exec(cmd []byte) (response []byte, err error) {
-	var n int
-	var proLen []byte
-	var resLen uint64
-
-	if _, err = t.conn.Write(cmd); err != nil {
-		return response, err
-	}
-	// todo : save cmd history to disk
-
-	proLen = make([]byte, 8)
-	if _, err = t.conn.Read(proLen); err != nil {
-		return response, err
-	}
-	resLen = binary.BigEndian.Uint64(proLen)
-	for resLen > 0 {
-		buf := make([]byte, 1024)
-		if n, err = t.conn.Read(buf); err != nil {
-			return response, err
+func (self *OsqClient) cmdAnalyze(cmder *OsqCommand, c byte) (bool, error) {
+	if len(cmder.cmd.Bytes()) == 0 {
+		if c == 46 {
+			cmder.Type = typeReqHelpCmd
+		} else {
+			cmder.Type = typeReqQueryCmd
 		}
-		response = append(response, buf[0:n]...)
-		resLen -= uint64(n)
+	}
+	if cmder.Type == typeReqHelpCmd && c == 10 {
+		return true, nil
+	}
+	if cmder.Type == typeReqQueryCmd && c == 59 {
+		return true, nil
 	}
 
-	return response, nil
+	if c == 10 {
+		return false, nil
+	}
+
+	return false, cmder.cmd.WriteByte(c)
 }
 
-func (t *OsqClient) guide() {
+// ++++++ Check client quit command
+func (self *OsqClient) isQuit() (quit bool) {
+	buf := []byte{}
+	if len(buf) != 5 {
+		return false
+	}
+	if quit = (bytes.Compare(buf[0:5], []byte(`quit;`)) == 0); quit {
+	}
+	return quit
+}
+
+func (self *OsqClient) execCmd(reqType uint16, cmd []byte) (err error) {
+	var record Record
+	record = Record{c: self.conn.(*net.TCPConn)}
+	return record.write(reqType, cmd)
+}
+
+func (self *OsqClient) result() (resType uint16, data []byte, err error) {
+	var record Record
+	record = Record{c: self.conn.(*net.TCPConn)}
+	return record.read()
+}
+
+func (t *OsqClient) toStdout(data []byte) {
+	fmt.Fprintf(os.Stdout, "%s\n", data)
 	fmt.Fprintf(os.Stdout, "\033[31m%s:%d> \033[0m", t.Host, t.Port)
 }
